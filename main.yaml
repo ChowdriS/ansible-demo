@@ -7,4 +7,4 @@
         msg:
           server_name: "{{ server_name }}"
           port: "{{ port }}"
-          env: "{{ environment }}"
+          env: "{{ env }}"
