@@ -1,0 +1,10 @@
+- name: Verify inventory variables
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Display variables
+      debug:
+        msg:
+          server_name: "{{ server_name }}"
+          port: "{{ port }}"
+          environment: "{{ environment }}"
