@@ -5,6 +5,7 @@
     - name: Display variables
       debug:
         msg:
-          server_name: "{{ server_name }}"
-          port: "{{ port }}"
-          env: "{{ env }}"
+          # server_name: "{{ server_name }}"
+          # port: "{{ port }}"
+          # env: "{{ env }}"
+          num: "{{ num }}"
