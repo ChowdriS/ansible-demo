@@ -1,109 +1,156 @@
 ---
-title: "Per-User RBAC in an Azure AI Foundry Multi-Agent System: What Actually Works"
+title: "Per-User RBAC in an Azure AI Foundry Multi-Agent System"
 author: Chowdri S
-date: 2026-08-10
+date: 2026-08-15
 tags: [azure-ai-foundry, a2a-protocol, rbac, multi-agent, agent-framework]
 summary: >
-  We set out to restrict which users can reach which specialist agents — and
-  which tools inside them — in an orchestrator + sub-agent system built on
-  Azure AI Foundry's A2A protocol. Along the way we hit two dead ends that
-  are silently by-design platform limitations, not bugs in our code, and
-  landed on an architecture that actually enforces per-user access control
-  end to end. This is the full story, with the code and the receipts.
+  We wanted one orchestrator agent to hand questions off to specialist
+  sub-agents, with different users getting different access depending on
+  their real Azure role. Two platform limitations stood in the way — one
+  we found a real fix for, one that turned out to be by design and forced
+  a redesign. This is the full story: what broke, why, and what we built
+  instead — with the code.
 ---
 
-# Per-User RBAC in an Azure AI Foundry Multi-Agent System: What Actually Works
+# Per-User RBAC in an Azure AI Foundry Multi-Agent System
 
-| # | Question | Answer |
-|---|---|---|
-| 1 | Can an orchestrator restrict which *sub-agent* a user can reach? | **Yes** — agent-level RBAC, working in production |
-| 2 | Can a sub-agent restrict which *tools* a caller can use inside it? | **Yes** — tool-level RBAC, working in production |
-| 3 | Does the caller's identity survive a real A2A protocol call to the sub-agent? | **No** — confirmed platform limitation, not a bug we introduced |
-| 4 | So how does tool-level RBAC work at all? | The orchestrator resolves the caller's role itself (Azure RBAC is the source of truth), then hands the sub-agent a signed, short-lived claim over a **direct, non-A2A** call |
+An orchestrator agent that hands a question off to the right specialist,
+and different users getting different access depending on who they
+actually are — that was the whole ask. It sounds like it should be a
+solved problem. It isn't, quite, and figuring out exactly where it stops
+being solved is the interesting part of this story.
+
+We built the system twice. The first version worked right up until the
+moment we tested it with two different users instead of one, at which
+point it quietly did the wrong thing — every user got every specialist's
+answer, restricted or not, and nothing in the logs looked like an error.
+The second version is the one running in production today, and it only
+exists because we went and found out *exactly* why the first one failed,
+instead of assuming a workaround would paper over it.
+
+## The short version
+
+| Question | Answer |
+|---|---|
+| Can an orchestrator restrict which *sub-agent* a user can reach? | **Yes.** Agent-level RBAC, live in production. |
+| Can a sub-agent restrict which *tools* a caller can use inside it? | **Yes.** Tool-level RBAC, live in production. |
+| Does the caller's identity survive a real A2A protocol call to the sub-agent? | **No.** Confirmed platform behavior, not a bug in our code. |
+| So how does tool-level RBAC work at all, then? | The orchestrator resolves the caller's role itself against Azure RBAC, then hands the sub-agent a signed, short-lived claim over a **direct, non-A2A** call. |
+
+> **Scope:** everything below is what we built, deployed, and tested
+> ourselves against live Foundry agents. It doesn't cover Foundry's native
+> `AgenticIdentityToken` / OAuth-passthrough connection mechanism — that's
+> a separate, still-being-evaluated avenue, deliberately out of scope here.
+
+## Contents
+
+1. [What we set out to build](#what-we-set-out-to-build)
+2. [Stack](#stack)
+3. [Two building blocks: Agent Framework and A2A](#two-building-blocks-agent-framework-and-a2a)
+4. [Round one: wire it all up over A2A](#round-one-wire-it-all-up-over-a2a)
+5. [The quiet failure](#the-quiet-failure)
+6. [Fixing the first problem: does this user get to ask at all?](#fixing-the-first-problem-does-this-user-get-to-ask-at-all)
+7. [Wanting more: not just "can they ask," but "what can they do"](#wanting-more-not-just-can-they-ask-but-what-can-they-do)
+8. [Five ways to smuggle an identity across a network hop, and why none of them worked](#five-ways-to-smuggle-an-identity-across-a-network-hop-and-why-none-of-them-worked)
+9. [The fix: stop asking A2A to do something it won't](#the-fix-stop-asking-a2a-to-do-something-it-wont)
+10. [What we'd tell someone about to build this](#what-wed-tell-someone-about-to-build-this)
+11. [Where this still has sharp edges](#where-this-still-has-sharp-edges)
+12. [Appendix A — RBAC grants](#appendix-a--required-azure-rbac-grants)
+13. [Appendix B — verification commands](#appendix-b--verification-commands)
+14. [References](#references)
 
 ---
 
-## 1. What We Set Out to Build
+## What we set out to build
 
-An orchestrator agent that takes a user's question and routes it to the
-right specialist sub-agent over the A2A (Agent-to-Agent) protocol — plus
-**per-user access control** on top: not every user should reach every
-sub-agent, and not every user who *can* reach one should get every
-capability inside it. We wanted that restriction driven by the user's
-**actual Azure RBAC role**, not a hand-maintained permission list living
-in application code.
+A travel assistant, as a stand-in for the real thing: one orchestrator,
+two specialists. `tamilDestinations` — temples, beaches, hill stations —
+open to everyone. `tamilFoodCulture` — cuisine, festivals, culture —
+treated as restricted, premium content. Two requirements, one nested
+inside the other:
 
-Test system: a travel assistant with two specialists —
-`tamilDestinations` (temples, beaches, hill stations — open to everyone)
-and `tamilFoodCulture` (cuisine, festivals, culture — treated as
-restricted/premium). Goal: users without access to the food/culture
-project shouldn't get answers from it, even indirectly through the
-orchestrator — and among users who *can* reach it, only some should be
-allowed to *write* new content, not just read.
+- Users without access to the food/culture project shouldn't get answers
+  from it, even indirectly, even by going through the orchestrator.
+- Among the users who *can* reach it, only some should be allowed to
+  *write* new content — submit a review, say — not just read.
+
+The requirement underneath both of those: the access decision had to come
+from the user's **actual Azure RBAC role**, the same role-assignment data
+Azure already tracks for everything else, not a second permission system
+we'd have to invent and keep in sync by hand.
+
+```mermaid
+flowchart LR
+    U["👤 User"] -->|"question"| O["Orchestrator"]
+    O -->|"open to everyone"| D["tamilDestinations"]
+    O -.->|"restricted — role-gated"| F["tamilFoodCulture"]
+    style F stroke-dasharray: 5 5
+```
 
 ---
 
-## 2. Tech Stack
+## Stack
 
 | Layer | What we used |
 |---|---|
-| Agent hosting | **Azure AI Foundry Agent Service** — hosted agents (Docker containers behind a Foundry-managed endpoint) |
-| Agent SDK | **Microsoft Agent Framework** (`agent_framework`) — `Agent`, `FoundryChatClient`, tools/skills |
-| Server runtime | **`azure-ai-agentserver-responses` / `-core`** — `ResponsesAgentServerHost`, `ResponseContext`, `get_request_context()` |
-| Agent-to-agent | **A2A protocol** — `a2a-sdk`, `agent_framework.a2a.A2AAgent`, `A2ACardResolver` |
-| Access control | **Azure RBAC / ARM `roleAssignments` REST API** — the single source of truth for every decision |
-| Build & deploy | Docker + Azure Container Registry, `az` CLI + Foundry Agents REST API (`POST /agents`, `PATCH /agents/{name}`) |
+| Agent hosting | Azure AI Foundry Agent Service — Hosted Agents, each a Docker container behind a Foundry-managed endpoint |
+| Agent SDK | Microsoft Agent Framework (`agent_framework`) — `Agent`, `FoundryChatClient`, tools/skills |
+| Server runtime | `azure-ai-agentserver-responses` / `-core` — `ResponsesAgentServerHost`, `ResponseContext`, `get_request_context()` |
+| Agent-to-agent | A2A protocol — `a2a-sdk`, `agent_framework.a2a.A2AAgent`, `A2ACardResolver` |
+| Access control | Azure RBAC via the ARM `roleAssignments` REST API — the single source of truth for every decision |
+| Build & deploy | Docker + Azure Container Registry, `az` CLI + Foundry Agents REST API |
 | Language | Python 3.11 |
 
-**Reference:** [Deploy a Hosted Agent — Microsoft Learn](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/deploy-hosted-agent)
+*Reference: [Deploy a Hosted Agent — Microsoft Learn](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/deploy-hosted-agent)*
 
 ---
 
-## 3. A Quick Primer: Agent Framework + A2A
+## Two building blocks: Agent Framework and A2A
 
-`agent_framework`'s core idea: an `Agent` wraps a chat client
-(`FoundryChatClient`, pointed at a Foundry model deployment) plus a list of
-Python functions as "tools." Separately, `agent_framework.a2a` lets you
-wrap *another agent's* A2A endpoint so it looks like just another tool —
-`A2AAgent(...).as_tool(...)` — so an orchestrator's LLM calls a sub-agent
-exactly like it calls a local function.
+Worth pausing on these before the story gets into what broke, since
+everything downstream depends on understanding what each one actually is.
 
-Foundry hosts each agent as its own container behind a managed endpoint
-that can expose several protocols side by side: **`responses`** (plain
-request/response, every hosted agent supports it) and, optionally,
-**`a2a`** (discovery/invocation via a standard Agent Card — served at
-Foundry's own `/agentCard/v1.0` path rather than the A2A spec's usual
-`/.well-known/agent.json`).
+**Agent Framework**'s core idea is small: an `Agent` wraps a chat client —
+`FoundryChatClient`, pointed at a model deployment — plus a list of Python
+functions it can call as tools. Nothing exotic. What makes it useful for a
+multi-agent system is `agent_framework.a2a`, which lets you wrap *another
+agent's* A2A endpoint so it looks, from the calling agent's point of view,
+like just one more tool: `A2AAgent(...).as_tool(...)`. The orchestrator's
+LLM calls a specialist exactly the way it would call a local function —
+it has no idea there's a network hop, a container boundary, and an
+entirely separate identity involved.
 
-**References:**
-[A2A Tool Guide — Microsoft Learn](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/tools/agent-to-agent) ·
-[Enable A2A Endpoint — Microsoft Learn](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/enable-agent-to-agent-endpoint) ·
-[A2A Protocol Specification](https://a2a-protocol.org/latest/) ·
-[agent-framework repo](https://github.com/microsoft/agent-framework) ·
-[a2a-sdk repo](https://github.com/google-a2a/a2a-python)
+**A2A** is the protocol that makes that hop possible. Foundry hosts every
+agent behind a managed endpoint that can speak more than one protocol at
+once: `responses` (plain request/response — every hosted agent supports
+this) and, optionally, `a2a` — discovery and invocation through a
+standard Agent Card. One Foundry-specific wrinkle worth knowing up front:
+the card lives at `/agentCard/v1.0`, not the A2A spec's usual
+`/.well-known/agent.json`. It cost us a debugging session the first time.
+
+*References: [A2A Tool Guide](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/tools/agent-to-agent) · [Enable A2A Endpoint](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/enable-agent-to-agent-endpoint) · [A2A Protocol Spec](https://a2a-protocol.org/latest/) · [agent-framework](https://github.com/microsoft/agent-framework) · [a2a-sdk](https://github.com/google-a2a/a2a-python)*
 
 ---
 
-## 4. First Attempt: All Hosted Agents, Sub-agents Registered as A2A Tools
+## Round one: wire it all up over A2A
 
-The initial architecture: deploy all three agents (orchestrator + 2
-specialists) as Foundry Hosted Agents, have the orchestrator discover each
-specialist's Agent Card, and register it as a callable tool invoked over
-the real A2A endpoint.
-
-The two documented ways to do this both turned out to be broken:
+The plan was straightforward: deploy all three agents as Foundry Hosted
+Agents, have the orchestrator fetch each specialist's Agent Card, and
+register it as a tool it could call over the real A2A endpoint. Two
+documented ways exist to do that registration. Both are broken.
 
 ```python
-# Method 1 - broken
+# Documented method 1
 from azure.ai.projects.models import A2APreviewTool
 tool = A2APreviewTool(project_connection_id=connection.id)
 
-# Method 2 - broken, same underlying bug
+# Documented method 2 - same underlying bug
 from agent_framework.foundry import FoundryChatClient
 tool = FoundryChatClient.get_a2a_tool(project_connection_id=conn_id)
 ```
 
-Both fail with:
+Both throw the same error, regardless of which one you pick:
+
 ```json
 {
   "message": "Agent card path must target the same host, project, and agent as the server URL.",
@@ -112,11 +159,11 @@ Both fail with:
 }
 ```
 
-**Reference:** [GitHub Azure/azure-sdk-for-python#47419](https://github.com/Azure/azure-sdk-for-python/issues/47419) — open, labeled `needs-team-attention`, unresolved as of this writing.
+That's [GitHub #47419](https://github.com/Azure/azure-sdk-for-python/issues/47419) — open, `needs-team-attention`, still unresolved as of this writing.
 
-**What actually worked** — the lower-level `A2AAgent` class with a manual
-auth interceptor. From `a2a/orchestrator/main.py:283-314`
-(`build_a2a_agent()`):
+What actually works is a level lower: `A2AAgent` directly, with a manual
+auth interceptor supplying the bearer token yourself. From
+`a2a/orchestrator/main.py:283-314`:
 
 ```python
 async def build_a2a_agent(name, url, description, http_client):
@@ -137,34 +184,32 @@ async def build_a2a_agent(name, url, description, http_client):
     return a2a_agent
 ```
 
-This got real A2A communication working end to end — orchestrator to both
-specialists, LLM correctly routing by topic.
+That got real A2A communication working end to end — the orchestrator
+correctly routed questions to both specialists by topic. Demo-ready. Also,
+as it turned out, hiding the actual problem rather than solving it.
 
 ---
 
-## 5. What We Found: Identity Wasn't Flowing Through At All
+## The quiet failure
 
-Getting A2A *connectivity* working just exposed the actual problem. The
-`http_client` above is authenticated with the **orchestrator's own managed
-identity token**, never the real end user's. So:
-
-- Call the restricted specialist **directly** with a user's own token →
-  Azure RBAC applies correctly, unauthorized users get `403`.
-- Call the *same* specialist **through the orchestrator** → succeeds
-  regardless of the real user's access, because only the orchestrator's
-  own (broadly-privileged) identity is ever checked.
-
-We proved this with a VM whose managed identity had access to the public
-specialist's project but deliberately **not** the restricted one:
+`http_client` in the snippet above is authenticated with **the
+orchestrator's own managed identity token**. Not the user's. Every call
+the orchestrator makes to a specialist happens as "the orchestrator,"
+regardless of who's actually asking. Called directly, Azure RBAC still
+works exactly as you'd expect:
 
 | Test | Result |
 |---|---|
-| Direct call to `tamilDestinations` (public) | ✅ PASS |
-| Direct call to `tamilFoodCulture` (restricted) | ❌ 403 DENIED — correct |
-| Same question, through the orchestrator | ✅ succeeded anyway |
+| Direct call to `tamilDestinations` (public) | ✅ Passes |
+| Direct call to `tamilFoodCulture` (restricted), unauthorized caller | ❌ `403` — correct |
+| Same restricted question, same unauthorized caller, through the orchestrator | ✅ **Succeeds anyway** |
 
-We also inspected `ResponseContext` directly for anything resembling the
-caller's identity:
+We confirmed it deliberately, not by accident: a VM with a managed
+identity granted access to the public specialist's project and
+*explicitly not* the restricted one. Direct calls behaved correctly.
+Calls through the orchestrator didn't. We also went looking inside
+`ResponseContext` for anything resembling the caller's real identity, on
+the theory that maybe it was there and we just weren't reading it right:
 
 ```
 context_attrs: ['client_headers', 'conversation_id', 'created_at',
@@ -176,24 +221,26 @@ context.isolation.user_key  -> does not exist
 context.request.headers     -> Authorization already stripped
 ```
 
-**References:**
-[GitHub #45797 — "Hosted Agent removes Authorization Header disabling OBO"](https://github.com/Azure/azure-sdk-for-python/issues/45797) (open) ·
-[Microsoft Q&A: User Identity Passthrough for Hosted Agents](https://learn.microsoft.com/en-us/answers/questions/5872669/user-identity-passthrough-for-hosted-agents-callin) — official confirmation: *"For code-first Hosted Agents, OAuth flows are handled externally by the service layer... user tokens are not exposed within container runtime."*
+It wasn't a reading problem. The platform genuinely wasn't handing it
+over.
+
+*References: [GitHub #45797 — Hosted Agent removes Authorization Header disabling OBO](https://github.com/Azure/azure-sdk-for-python/issues/45797) (open) · [Microsoft Q&A: User Identity Passthrough for Hosted Agents](https://learn.microsoft.com/en-us/answers/questions/5872669/user-identity-passthrough-for-hosted-agents-callin) — official: "For code-first Hosted Agents, OAuth flows are handled externally by the service layer... user tokens are not exposed within container runtime."*
 
 ---
 
-## 6. The Breakthrough: Agent-Level RBAC via a Prehook
+## Fixing the first problem: does this user get to ask at all?
 
-While chasing the above, we found Foundry **does** inject one genuinely
-trustworthy piece of per-request identity: an `x-agent-user-id` header,
-surfaced in code as `get_request_context().user_id`. Verified empirically
-to be the caller's real Entra Object ID — available on a direct call to
-the orchestrator's own Responses endpoint (the first hop: user →
-orchestrator).
+While chasing the above, we found the one piece of per-request identity
+Foundry *does* hand over honestly: an `x-agent-user-id` header, surfaced
+in code as `get_request_context().user_id`. We checked — it really is the
+caller's Entra Object ID, not some opaque platform token — and it's
+available the moment a real user's request lands on the orchestrator's
+own endpoint. First hop, solved, for free.
 
-That gave us a design for **agent-level** RBAC — can this caller reach a
-given sub-agent at all — as a "prehook" the orchestrator runs *before* it
-builds the LLM's tool list. From `a2a/orchestrator/main.py:104-142`:
+That's enough to build real agent-level RBAC: before the orchestrator
+even constructs the LLM's tool list, it checks whether this specific
+caller has any role on a given specialist's project. From
+`a2a/orchestrator/main.py:104-142`:
 
 ```python
 async def check_access(credential, principal_id: str | None, project_name: str) -> bool:
@@ -215,45 +262,49 @@ async def check_access(credential, principal_id: str | None, project_name: str) 
     return False
 ```
 
-**Reference:** [ARM Role Assignments — List REST API](https://learn.microsoft.com/en-us/rest/api/authorization/role-assignments/list-for-scope)
+*Reference: [ARM Role Assignments — List REST API](https://learn.microsoft.com/en-us/rest/api/authorization/role-assignments/list-for-scope)*
 
-Wired into `build_agent_for_caller()` (`a2a/orchestrator/main.py:321-376`):
-allowed callers get a real tool that fetches the agent card and makes the
-real A2A call; everyone else gets a **dummy tool** — same name and
-description — that returns `ACCESS_DENIED: ...` immediately, with **no
-network call at all** (`create_dummy_tool()`, `main.py:207-217`). The
-system prompt instructs the LLM to relay that denial plainly and never
-fabricate an answer for it.
+Wired into `build_agent_for_caller()` (`main.py:321-376`): if the check
+passes, the caller gets a real tool — fetch the agent card, make the real
+A2A call. If it doesn't, they get a **dummy tool**, same name, same
+description, that returns `ACCESS_DENIED: ...` immediately with no
+network call at all (`create_dummy_tool()`, `main.py:207-217`). The system
+prompt tells the LLM to relay that denial exactly as given, never to
+paper over it with a guess.
 
-> **A real bug we hit and fixed:** Azure's role-assignment *list* API,
-> queried at scope `S`, returns matches **at and below** `S` by default —
-> not only exact matches at `S`. Walking *up* the ancestor chain
-> (project → account → subscription) to catch broader inherited grants
-> means a naive "any result = allowed" check can be fooled by a grant that
-> only exists on a **sibling** project under the same account. Fix: only
-> count a match whose own `properties.scope` **exactly equals** the scope
-> you queried — visible in the exact-match comparison above.
+> **The one real bug in this part, and it's a sneaky one.** Azure's
+> role-assignment list API, queried at some scope `S`, returns matches
+> **at S and everything below it** by default — not only exact matches at
+> `S`. We walk *up* the ancestor chain (project → account → subscription)
+> deliberately, to catch broader inherited grants — but that means a naive
+> "any result came back = allowed" check can be fooled by a grant that
+> only exists on a completely unrelated **sibling** project under the same
+> account. The fix is the exact-match comparison in the snippet above:
+> only count a result whose own `properties.scope` is identical to the
+> scope you actually queried.
 
-This alone gives working, verified agent-level RBAC: a caller either can
-or cannot reach a given sub-agent, enforced before any sub-agent code runs.
+That alone is a complete, working answer to "can this caller reach this
+sub-agent at all" — enforced before any sub-agent code runs.
 
 ---
 
-## 7. The Next Ambition: Tool-Level RBAC, and the Wall We Hit
+## Wanting more: not just "can they ask," but "what can they do"
 
-Agent-level access is binary. We wanted finer granularity: *within* one
-sub-agent, some callers get read-only tools, others get read+write. That
-means getting the caller's identity — or a resolved permission — **into
-the sub-agent's own container code**: a second network hop
-(orchestrator → sub-agent), a fundamentally different problem than the
-first hop that `x-agent-user-id` already solved for free.
+Agent-level access is a single switch: on or off. We wanted a dial.
+Within one sub-agent, some callers should get read-only tools, others
+read *and* write. That means the caller's identity — or at least a
+permission decision already made about them — has to make it **into the
+sub-agent's own container code**. Which sounds like a small step up from
+what we'd just solved. It isn't. `x-agent-user-id` solves the first hop —
+user to orchestrator. This is the *second* hop — orchestrator to
+sub-agent — and nothing says the platform treats those the same way.
 
-We tested it directly: called the orchestrator as ourselves, had it call a
-specialist over real A2A using the orchestrator's own separate managed
-identity, and inspected what the specialist's container actually saw.
-**Result: only ever the orchestrator's own identity arrived as the caller
-— never the real end user's.** Debug tooling used to confirm this, still
-present in the code today (`a2a/specialist1/main.py:69-106`):
+It doesn't. We tested it directly: called the orchestrator as ourselves,
+had it call a specialist over real A2A using its own separate managed
+identity, and looked at what the specialist's container actually
+received. Only ever the orchestrator's identity. Never ours. We left the
+debug tooling that proved this in the code — it's still there today
+(`a2a/specialist1/main.py:69-106`):
 
 ```python
 if user_input.strip().lower() == "checkheaders":
@@ -268,70 +319,92 @@ if user_input.strip().lower() == "checkrawheaders":
     return TextResponse(context, request, text=f"raw_headers={_raw_headers_var.get()!r}")
 ```
 
-Same conclusion via the orchestrator's own `checkbaggage` debug command
-(`a2a/orchestrator/main.py:401-422`), which calls a specialist over A2A and
-reports both the real caller's `user_id` and what the specialist says it
-received — they never matched.
+The orchestrator's own `checkbaggage` debug command (`main.py:401-422`)
+tells the same story from the other end — it calls a specialist over A2A
+and reports both the real caller's `user_id` and whatever the specialist
+says it received. The two never matched.
 
 ---
 
-## 8. Every Channel We Tried to Get Identity Across the A2A Hop
+## Five ways to smuggle an identity across a network hop, and why none of them worked
 
-All tested empirically against live deployed Foundry hosted agents, not
-simulated:
+At this point the question stopped being "can we find the identity" and
+became "is there *any* channel across an A2A call that isn't being
+scrubbed." We went through everything we could think of, tested live
+against real deployed agents rather than reasoned about in the abstract:
 
-| Channel tried | Result | Detail & reference |
+| Channel tried | Result | What we actually saw |
 |---|---|---|
-| Custom `x-client-*` HTTP header | ❌ Arrives empty | Client SDK confirmed to put it on the wire correctly (source-read of `agent_framework_a2a`/`a2a-sdk`) — the loss is server-side |
-| OpenTelemetry `baggage` header | ⚠️ Survives, but gets replaced | Our own `caller-user-id` value never arrived; only Foundry's own keys did — see [W3C Baggage spec](https://www.w3.org/TR/baggage/) for how the mechanism is supposed to work |
-| A2A `Message.metadata` | ❌ Overwritten entirely | Sent `{"caller_user_id": ...}`, got back Foundry's own `{'protocol': 'a2a', 'a2a_context_id': ..., ...}` |
-| A2A structured `Part.data` | ❌ Rejected outright | `ContentTypeNotSupportedError` — agent card only declares a `text` input mode. The A2A spec's own repo tracks this exact gap: [a2aproject/A2A#19 — "Delegated User Authorization for Agent2Agent Servers"](https://github.com/a2aproject/A2A/issues/19), open, unresolved |
-| `context.isolation` / `.user_key` | ❌ Doesn't exist | Confirmed via direct attribute inspection |
-| Plain text message content | ✅ The only thing that reliably survives | Everything that works in this system routes through this |
+| Custom `x-client-*` HTTP header | ❌ Arrives empty | The client SDK does put it on the wire correctly — confirmed by reading `agent_framework_a2a`/`a2a-sdk` source. The loss happens server-side. |
+| OpenTelemetry `baggage` header | ⚠️ Survives, but gets replaced | Our own `caller-user-id` value never showed up on the other end — only Foundry's own baggage keys did. |
+| A2A `Message.metadata` | ❌ Overwritten entirely | Sent `{"caller_user_id": ...}`; got back Foundry's own `{'protocol': 'a2a', 'a2a_context_id': ..., ...}` with our keys gone. |
+| A2A structured `Part.data` | ❌ Rejected outright | `ContentTypeNotSupportedError` — the agent card only declares a `text` input mode. |
+| `context.isolation` / `.user_key` | ❌ Doesn't exist | Confirmed by direct attribute inspection, not just absence from the docs. |
+| Plain text message content | ✅ The only thing that reliably survives | Everything that actually works in this system routes through this. |
 
-**Root cause, confirmed by capturing raw ASGI headers** (a temporary debug
-middleware dumping every header the container process actually receives —
-`a2a/specialist1/main.py:22-38`, `RawHeaderCaptureMiddleware`): there are
-**two separate strip points**, not one.
+We didn't stop at "it doesn't work" — we wanted the actual mechanism,
+because "it's stripped somewhere" isn't something you can design around.
+So we added a temporary debug middleware to a test sub-agent
+(`a2a/specialist1/main.py:22-38`, `RawHeaderCaptureMiddleware`) that dumps
+every raw header the container process receives, bypassing the SDK's own
+narrow filtering entirely. That's how we found there are **two separate
+strip points**, not one:
 
 1. An **ingress reverse proxy** allowlists a fixed set of Foundry's own
-   headers plus anything prefixed `x-client-`. Anything else is dropped
-   before the container sees it — true for direct calls and A2A calls
+   headers, plus anything prefixed `x-client-`. Anything else, any name,
+   never reaches the container — true for direct calls and A2A calls
    alike.
-2. An **A2A-specific internal step**: even `x-client-*` headers, which
-   survive step 1 on both paths, still arrive empty specifically on the
-   A2A path. Foundry's A2A-to-Responses bridge reconstructs a brand-new
-   internal request to actually invoke the sub-agent's handler, and that
-   reconstruction doesn't carry custom headers forward.
+2. An **A2A-specific step, deeper in**: even `x-client-*` headers, which
+   survive the proxy on both paths, still arrive empty specifically on
+   the A2A path. Foundry's A2A-to-Responses bridge builds a brand-new
+   internal request to actually invoke the sub-agent's handler for that
+   hop, and that reconstruction simply doesn't carry custom headers
+   forward.
 
-We checked whether a newer SDK version changes this (installed the newest
-available alpha at the time, `agent-framework-foundry-hosting`
-1.0.0a260630, and read its source) — built on the identical underlying
-primitives, no change.
+We checked whether a newer SDK closed this gap — installed the newest
+available alpha at the time (`agent-framework-foundry-hosting`
+1.0.0a260630) and read its source directly. Same underlying primitives.
+No change.
 
-**Corroborating references:**
-[Agent Identity Concepts — Microsoft Learn](https://learn.microsoft.com/en-us/azure/foundry/agents/concepts/agent-identity) (defines Attended/OBO vs. Unattended modes — hosted agents run Unattended) ·
-[Securing a Multi-Agent AI Solution: the Complexities of OBO — Microsoft Tech Community](https://techcommunity.microsoft.com/blog/azurearchitectureblog/securing-a-multi-agent-ai-solution-focused-on-user-context--the-complexities-of-/4493308) ·
-["Authorization Propagation in Multi-Agent AI Systems," arXiv:2605.05440](https://arxiv.org/pdf/2605.05440) — *"RBAC cannot express 'this agent may access this dataset only when acting on behalf of a specific user within a specific workflow.'"*
+*Corroborating references: [Agent Identity Concepts](https://learn.microsoft.com/en-us/azure/foundry/agents/concepts/agent-identity) — defines Attended/OBO vs. Unattended modes; hosted agents run Unattended · [Securing a Multi-Agent AI Solution: the Complexities of OBO — Microsoft Tech Community](https://techcommunity.microsoft.com/blog/azurearchitectureblog/securing-a-multi-agent-ai-solution-focused-on-user-context--the-complexities-of-/4493308) · ["Authorization Propagation in Multi-Agent AI Systems," arXiv:2605.05440](https://arxiv.org/pdf/2605.05440) — "RBAC cannot express 'this agent may access this dataset only when acting on behalf of a specific user within a specific workflow.'" · [a2aproject/A2A#19 — Delegated User Authorization for Agent2Agent Servers](https://github.com/a2aproject/A2A/issues/19), open at the protocol level*
 
 ---
 
-## 9. The Working Solution: Skip A2A for This Hop
+## The fix: stop asking A2A to do something it won't
 
-A2A's Agent Card is still fine for *discovery* — name, description,
-skills. But for the actual tool invocation on the restricted specialist,
-we call its **Responses-protocol endpoint directly** instead. A custom
-header sent straight to that endpoint arrives intact — no bridge, no
-reconstruction.
+Once the root cause was two concrete strip points instead of a vague "it
+doesn't work," the fix stopped being a mystery. A2A's Agent Card is still
+genuinely useful for *discovery* — name, description, skills, all served
+correctly. But for the one specialist that needs tool-level RBAC, we
+don't invoke it over A2A at all. We call its plain **Responses-protocol
+endpoint directly**, and a custom header sent straight there arrives
+completely intact — no bridge, no reconstruction, nothing in the way.
 
-Concretely: `tamilFoodCulture` skips A2A discovery and invocation
-entirely — its project name, agent name, and Responses URL are hardcoded
-Python constants in the orchestrator, since we already know them
-statically (`tamilDestinations` still goes through real A2A discovery,
-since it doesn't need tool-level RBAC).
+Concretely: `tamilFoodCulture`'s project name, agent name, and Responses
+URL are just hardcoded constants in the orchestrator, since we already
+know them statically. No A2A discovery, no A2A invocation, for this one
+hop. (`tamilDestinations` still goes through real A2A — it doesn't need
+tool-level RBAC, so there's no reason to give it up.)
 
-### 9.1 Resolving *which* role the caller has
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant O as Orchestrator
+    participant F as tamilFoodCulture
 
+    U->>O: "submit a review"
+    O->>O: check_access() — Tier 1
+    O->>O: get_effective_role() — Tier 2
+    O->>F: POST /responses<br/>x-client-caller-role-token: signed(role, ttl=60s)
+    F->>F: verify_role_claim()
+    F->>F: build tool list for role
+    F-->>O: response
+    O-->>U: response
+```
+
+### Resolving *which* role the caller has
+
+Not just "any access," but specifically Reader or Contributor. From
 `a2a/orchestrator/main.py:163-204`, `get_effective_role()`:
 
 ```python
@@ -342,21 +415,26 @@ _BUILTIN_ROLE_GUIDS = {
 ROLE_PRECEDENCE = ["Contributor", "Reader"]
 ```
 
-**Reference:** [Azure built-in roles — Reader](https://learn.microsoft.com/en-us/azure/role-based-access-control/built-in-roles/general#reader) · [Contributor](https://learn.microsoft.com/en-us/azure/role-based-access-control/built-in-roles/general#contributor) — GUIDs are fixed and identical in every Azure tenant.
+*Reference: [Azure built-in roles — Reader](https://learn.microsoft.com/en-us/azure/role-based-access-control/built-in-roles/general#reader) · [Contributor](https://learn.microsoft.com/en-us/azure/role-based-access-control/built-in-roles/general#contributor) — the GUIDs are fixed and identical in every Azure tenant.*
 
-> **A bug we hit here too:** we originally resolved the human-readable role
-> name via a live `GET .../roleDefinitions/{guid}` call. It silently
-> failed and always returned `None` — role *definitions* are a
-> subscription-level resource type, not nested under the Cognitive
-> Services account, so the orchestrator's account-scoped `Reader` grant
-> (enough for reading role *assignments*) doesn't cover reading role
-> *definitions*. Fix: skip the live lookup and use the hardcoded GUID map.
+> **A second bug, in the same neighborhood as the first.** We originally
+> resolved the human-readable role name with a live
+> `GET .../roleDefinitions/{guid}` call. It silently failed and always
+> returned `None` — role *definitions* live at the subscription level, not
+> nested under the Cognitive Services account, so the orchestrator's
+> account-scoped `Reader` grant (plenty for reading role *assignments*)
+> doesn't cover reading role *definitions*. The fix was to stop making
+> that call at all — Azure's built-in role GUIDs don't change, so a
+> hardcoded map removes both the extra network round-trip and the extra
+> permission requirement.
 
-### 9.2 Delivering the role to the sub-agent, securely
+### Handing the role to the sub-agent without letting anyone forge it
 
-Not as a plain header — anyone reaching the sub-agent's Responses endpoint
-directly could forge that and grant themselves write access — but as an
-**HMAC-signed, short-lived claim** (`a2a/orchestrator/role_token.py:31-47`,
+A plain header would work functionally, right up until someone who can
+reach the sub-agent's Responses endpoint directly — bypassing the
+orchestrator entirely — just sets it themselves and grants their own
+write access. So instead of a plain header, the orchestrator signs the
+claim, short TTL, HMAC (`a2a/orchestrator/role_token.py:31-47`,
 `sign_role_claim()`):
 
 ```python
@@ -369,13 +447,12 @@ def sign_role_claim(role, principal_id, ttl_seconds=60) -> str:
     return f"{payload_b64}.{sig}"
 ```
 
-**Reference:** [RFC 2104 — HMAC: Keyed-Hashing for Message Authentication](https://www.rfc-editor.org/rfc/rfc2104)
+*Reference: [RFC 2104 — HMAC: Keyed-Hashing for Message Authentication](https://www.rfc-editor.org/rfc/rfc2104)*
 
-Sent as `x-client-caller-role-token` on a direct POST to the sub-agent's
-Responses URL (`a2a/orchestrator/main.py:244-260`,
-`call_food_culture_direct()`).
+It travels as `x-client-caller-role-token` on the direct POST
+(`main.py:244-260`, `call_food_culture_direct()`).
 
-### 9.3 Sub-agent side: verify, then build a scoped tool list
+### The sub-agent side: verify, then build only the tools this role gets
 
 `a2a/specialist2/main.py`:
 
@@ -394,68 +471,74 @@ async def handler(request, context, _cancellation_signal):
     agent = Agent(client=client, name="TamilFoodCultureSpecialist", instructions=INSTRUCTIONS, tools=tools)
 ```
 
-For a Reader (or forged/missing-token) caller, `write_food_review` is
-**genuinely absent** from the LLM's tool list — not exposed and then
-blocked internally.
+For a Reader — or anyone with a missing or forged token — `write_food_review`
+isn't in the tool list at all. Not offered and then blocked. Genuinely not
+there for the LLM to even consider.
 
-**Verified end to end:** granted a test principal `Contributor` on the
-restricted project; the orchestrator's `checkrole` debug command confirmed
-`role='Contributor'`; a real request ("tell me about jigarthanda, and
-submit a review saying it's delicious") correctly used both
-`read_food_info` and `write_food_review` in the same turn.
-
----
-
-## 10. Inference From This POC
-
-- **Agent-level RBAC** is fully solved and running: real caller identity
-  via `x-agent-user-id` on the first hop, checked against live Azure RBAC
-  role assignments, enforced by registering dummy vs. real tools before
-  the LLM ever runs.
-- **Tool-level RBAC** is also solved, but required abandoning A2A as the
-  transport for that specific hop — identity/permission data doesn't
-  survive Foundry's A2A bridge through any channel we could find, and this
-  is a platform-wide, by-design limitation confirmed via multiple official
-  Microsoft Q&A threads, not something specific to our setup.
-- **What actually carries the permission decision**: the orchestrator
-  resolves it once, up front, using Azure RBAC as the single source of
-  truth, then hands it to the sub-agent as a signed, short-TTL claim over
-  a direct (non-A2A) call. The sub-agent never has to know anything about
-  RBAC itself — it only verifies a signature and builds its tool list.
-- **This is self-enforced authorization, not true delegated
-  authorization** — the orchestrator still does the real work using its
-  own identity; it just refuses to act unless it has separately verified
-  the real caller is allowed to ask. Good enough to gate access correctly;
-  not the same security model as a sub-agent independently validating a
-  real per-user token.
+We tested it the way you'd want to be shown, not just told: granted a
+test principal `Contributor` on the restricted project, confirmed
+`checkrole` reported it correctly, then sent a real conversational request
+— "tell me about jigarthanda, and submit a review saying it's delicious"
+— and watched it use both `read_food_info` and `write_food_review` in the
+same turn.
 
 ---
 
-## 11. Known Limitations
+## What we'd tell someone about to build this
 
-- **Role scope conflation** — `get_effective_role()` resolves against the
-  restricted project's own scope, so a `Contributor` grant given purely
-  for infra-management reasons on that project would *also* unlock the
-  write tool. Cleaner fix (not yet implemented): resolve against a
-  separate, otherwise-unused "marker" resource instead.
-- **Direct role assignments only** — a caller whose access comes solely
-  from an Entra group membership isn't detected by either tier's check.
-- **No revocation propagation** — the per-caller tool set is cached for
-  the life of the container process; a mid-session access revocation
-  won't be reflected until a new process picks up the request.
-- **A caller who reaches the sub-agent's Responses endpoint directly**,
-  bypassing the orchestrator, with no valid signed role token, fails
-  closed to read-only.
-- **A two-static-instance alternative was considered and validated as
-  legitimate, but not adopted**: deploy two copies of the same image with
-  a different `AGENT_ROLE` environment variable per deployment, orchestrator
-  picks which URL to call. Officially supported Foundry pattern; sidesteps
-  the whole "does data survive the hop" problem, at the cost of doubling
-  compute per tier.
+- **Agent-level RBAC works, cleanly.** The real caller's identity arrives
+  honestly on the first hop (`x-agent-user-id`), checked against live
+  Azure RBAC, enforced by swapping in a dummy tool before the LLM ever
+  gets involved.
+- **Tool-level RBAC also works — but only once you stop expecting A2A to
+  carry it.** Identity and permission data don't survive Foundry's A2A
+  bridge, through any channel we could find, and multiple official
+  Microsoft Q&A threads confirm this is deliberate platform behavior, not
+  something specific to our deployment.
+- **The permission decision has to be made once, up front, by something
+  that already has the full picture** — here, the orchestrator, using
+  Azure RBAC as ground truth — and then handed downstream as a signed
+  claim over a plain, non-A2A call. The sub-agent doesn't need to
+  understand RBAC at all. It just verifies a signature and builds a tool
+  list.
+- **Be honest with yourself about what security model this actually is.**
+  This is self-enforced authorization, not delegated authorization. The
+  orchestrator still does the real work under its own identity; it simply
+  refuses to act until it's separately convinced the real caller is
+  allowed to ask. That's enough to gate access correctly. It is not the
+  same guarantee as a sub-agent independently validating a genuine
+  per-user token.
 
 ---
 
-## Appendix A — Required Azure RBAC Grants
+## Where this still has sharp edges
+
+- **Role scope conflation.** `get_effective_role()` currently resolves
+  against the restricted project's own scope — so a `Contributor` grant
+  given purely for infrastructure-management reasons on that project
+  would *also* unlock the write tool. The cleaner fix, not yet built:
+  resolve against a separate, otherwise-unused "marker" resource instead,
+  so infra access and app-data access are provably different grants.
+- **Direct role assignments only.** A caller whose access comes solely
+  from Entra group membership won't be detected by either check.
+- **No revocation propagation.** The per-caller tool set is cached for the
+  life of the container process — a mid-session revocation doesn't take
+  effect until a fresh process picks up the next request.
+- **Bypassing the orchestrator fails closed, which is the point.** A
+  caller who hits the sub-agent's Responses endpoint directly, with no
+  valid signed token, gets read-only. There's nothing to forge — the
+  token is signed by code they don't control.
+- **A simpler alternative exists, and we validated it without adopting
+  it:** deploy two static copies of the same image, each with a different
+  `AGENT_ROLE` environment variable, and have the orchestrator pick which
+  URL to call. This is an officially supported Foundry pattern, and it
+  sidesteps the entire "does data survive the hop" question by never
+  asking it — at the cost of doubling compute per permission tier, which
+  stops being appealing past two or three tiers.
+
+---
+
+## Appendix A — Required Azure RBAC grants
 
 **Orchestrator's own managed identity:**
 ```bash
@@ -482,7 +565,7 @@ az role assignment create --role "Reader" \
 
 ---
 
-## Appendix B — Verification Commands
+## Appendix B — Verification commands
 
 ```bash
 TOKEN=$(az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv)
@@ -523,28 +606,30 @@ curl -s -X POST "$BASE/agents/travelOrchestrator/endpoint/protocols/openai/respo
 7. [Azure built-in roles reference](https://learn.microsoft.com/en-us/azure/role-based-access-control/built-in-roles/general)
 
 **Microsoft Q&A**
+
 8. [User Identity Passthrough for Hosted Agents Calling a Custom MCP Server](https://learn.microsoft.com/en-us/answers/questions/5872669/user-identity-passthrough-for-hosted-agents-callin)
 
-**GitHub Issues**
-9. [Azure/azure-sdk-for-python#47419 — A2APreviewTool "Agent card path" error](https://github.com/Azure/azure-sdk-for-python/issues/47419) (open)
-10. [Azure/azure-sdk-for-python#45797 — Hosted Agent removes Authorization Header disabling OBO](https://github.com/Azure/azure-sdk-for-python/issues/45797) (open)
-11. [Azure/azure-sdk-for-python#47474 — Error messages masked as "internal server error"](https://github.com/Azure/azure-sdk-for-python/issues/47474)
-12. [a2aproject/A2A#19 — Delegated User Authorization for Agent2Agent Servers](https://github.com/a2aproject/A2A/issues/19) (open, protocol-level gap)
+**GitHub issues**
 
-**SDK / Protocol**
+9. [Azure/azure-sdk-for-python#47419](https://github.com/Azure/azure-sdk-for-python/issues/47419) — A2APreviewTool "Agent card path" error (open)
+10. [Azure/azure-sdk-for-python#45797](https://github.com/Azure/azure-sdk-for-python/issues/45797) — Hosted Agent removes Authorization Header disabling OBO (open)
+11. [Azure/azure-sdk-for-python#47474](https://github.com/Azure/azure-sdk-for-python/issues/47474) — Error messages masked as "internal server error"
+12. [a2aproject/A2A#19](https://github.com/a2aproject/A2A/issues/19) — Delegated User Authorization for Agent2Agent Servers (open, protocol-level gap)
+
+**SDK / protocol**
+
 13. [agent-framework repository](https://github.com/microsoft/agent-framework)
 14. [a2a-sdk (Python) repository](https://github.com/google-a2a/a2a-python)
 15. [A2A Protocol Specification](https://a2a-protocol.org/latest/)
 16. [W3C Baggage specification](https://www.w3.org/TR/baggage/)
 17. [RFC 2104 — HMAC](https://www.rfc-editor.org/rfc/rfc2104)
 
-**Industry / Academic**
+**Industry / academic**
+
 18. ["Authorization Propagation in Multi-Agent AI Systems," arXiv:2605.05440](https://arxiv.org/pdf/2605.05440)
 19. [Securing a Multi-Agent AI Solution: the Complexities of OBO — Microsoft Tech Community](https://techcommunity.microsoft.com/blog/azurearchitectureblog/securing-a-multi-agent-ai-solution-focused-on-user-context--the-complexities-of-/4493308)
 
-**Internal (this repo, code cited throughout)**
-20. `a2a/orchestrator/main.py`, `a2a/orchestrator/role_token.py`
-21. `a2a/specialist1/main.py`, `a2a/specialist2/main.py`, `a2a/specialist2/role_token.py`
+**Code, cited throughout (this repository)**
 
-> Internal source code isn't yet pushed to a Git remote — citations above
-> are local paths; swap for GitLab links once pushed.
+20. `orchestrator/main.py`, `orchestrator/role_token.py`
+21. `specialist1/main.py`, `specialist2/main.py`, `specialist2/role_token.py`
