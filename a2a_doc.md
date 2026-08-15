@@ -325,6 +325,8 @@ target agent over a direct connection rather than through A2A.
 messages, and source references behind each part of the story above.
 Everything here maps directly back to a chapter number.*
 
+**Source code:** [gitlab.presidio.com/ai_works/azure_rbac_multiagents](https://gitlab.presidio.com/ai_works/azure_rbac_multiagents.git). Every code citation below links directly to the exact lines on GitLab.
+
 ### A. The stack
 
 | Layer | What we used |
@@ -359,7 +361,7 @@ Both fail with:
 ```
 Tracked as [GitHub #47419](https://github.com/Azure/azure-sdk-for-python/issues/47419), open and unresolved.
 
-What worked instead, from `orchestrator/main.py:283-314`:
+What worked instead, from [`orchestrator/main.py:283-314`](https://gitlab.presidio.com/ai_works/azure_rbac_multiagents/-/blob/main/orchestrator/main.py#L283-314):
 
 ```python
 async def build_a2a_agent(name, url, description, http_client):
@@ -413,7 +415,7 @@ context.request.headers     -> Authorization already stripped
 
 ### E. Chapter 4: the agent-level RBAC prehook
 
-`orchestrator/main.py:104-142`:
+[`orchestrator/main.py:104-142`](https://gitlab.presidio.com/ai_works/azure_rbac_multiagents/-/blob/main/orchestrator/main.py#L104-142):
 
 ```python
 async def check_access(credential, principal_id: str | None, project_name: str) -> bool:
@@ -435,9 +437,9 @@ async def check_access(credential, principal_id: str | None, project_name: str) 
     return False
 ```
 
-Wired into `build_agent_for_caller()` (`main.py:321-376`): allowed callers
+Wired into `build_agent_for_caller()` ([`orchestrator/main.py:321-376`](https://gitlab.presidio.com/ai_works/azure_rbac_multiagents/-/blob/main/orchestrator/main.py#L321-376)): allowed callers
 get a real tool; everyone else gets a dummy tool
-(`create_dummy_tool()`, `main.py:207-217`) returning
+(`create_dummy_tool()`, [`orchestrator/main.py:207-217`](https://gitlab.presidio.com/ai_works/azure_rbac_multiagents/-/blob/main/orchestrator/main.py#L207-217)) returning
 `ACCESS_DENIED: ...` with no network call at all.
 
 **Chapter 3, issue #10 (the sibling-project bug), exact fix:** only count
@@ -461,7 +463,7 @@ covering the target project.
 | Plain text message content | ✅ The only thing that reliably survives |
 
 Root cause, found via a temporary debug middleware dumping every raw
-header the container actually received (`specialist1/main.py:22-38`,
+header the container actually received ([`specialist1/main.py:22-38`](https://gitlab.presidio.com/ai_works/azure_rbac_multiagents/-/blob/main/specialist1/main.py#L22-38),
 `RawHeaderCaptureMiddleware`):
 
 1. An **ingress reverse proxy** allowlists a fixed set of Foundry's own
@@ -472,7 +474,7 @@ header the container actually received (`specialist1/main.py:22-38`,
    A2A-to-Responses bridge rebuilds the request internally for that hop
    and doesn't carry custom headers forward.
 
-Debug commands still in the code (`specialist1/main.py:69-106`):
+Debug commands still in the code ([`specialist1/main.py:69-106`](https://gitlab.presidio.com/ai_works/azure_rbac_multiagents/-/blob/main/specialist1/main.py#L69-106)):
 
 ```python
 if user_input.strip().lower() == "checkheaders":
@@ -507,7 +509,7 @@ sequenceDiagram
     O-->>U: response
 ```
 
-Resolving which role (`orchestrator/main.py:163-204`):
+Resolving which role ([`orchestrator/main.py:163-204`](https://gitlab.presidio.com/ai_works/azure_rbac_multiagents/-/blob/main/orchestrator/main.py#L163-204)):
 
 ```python
 _BUILTIN_ROLE_GUIDS = {
@@ -526,7 +528,7 @@ Services account, so the orchestrator's account-scoped `Reader` grant
 *definitions*. Fix: use the hardcoded GUID map above instead. These GUIDs
 are fixed and identical in every Azure tenant.
 
-Signing the role claim (`orchestrator/role_token.py:31-47`):
+Signing the role claim ([`orchestrator/role_token.py:31-47`](https://gitlab.presidio.com/ai_works/azure_rbac_multiagents/-/blob/main/orchestrator/role_token.py#L31-47)):
 
 ```python
 def sign_role_claim(role, principal_id, ttl_seconds=60) -> str:
@@ -539,9 +541,9 @@ def sign_role_claim(role, principal_id, ttl_seconds=60) -> str:
 ```
 
 Sent as `x-client-caller-role-token` on a direct POST
-(`orchestrator/main.py:244-260`, `call_food_culture_direct()`).
+([`orchestrator/main.py:244-260`](https://gitlab.presidio.com/ai_works/azure_rbac_multiagents/-/blob/main/orchestrator/main.py#L244-260), `call_food_culture_direct()`).
 
-Sub-agent side (`specialist2/main.py`):
+Sub-agent side ([`specialist2/main.py`](https://gitlab.presidio.com/ai_works/azure_rbac_multiagents/-/blob/main/specialist2/main.py)):
 
 ```python
 def get_allowed_tool_names(role: str) -> list[str]:
@@ -661,5 +663,5 @@ curl -s -X POST "$BASE/agents/travelOrchestrator/endpoint/protocols/openai/respo
 
 **Code, cited throughout (this repository)**
 
-20. `orchestrator/main.py`, `orchestrator/role_token.py`
-21. `specialist1/main.py`, `specialist2/main.py`, `specialist2/role_token.py`
+20. [`orchestrator/main.py`](https://gitlab.presidio.com/ai_works/azure_rbac_multiagents/-/blob/main/orchestrator/main.py), [`orchestrator/role_token.py`](https://gitlab.presidio.com/ai_works/azure_rbac_multiagents/-/blob/main/orchestrator/role_token.py)
+21. [`specialist1/main.py`](https://gitlab.presidio.com/ai_works/azure_rbac_multiagents/-/blob/main/specialist1/main.py), [`specialist2/main.py`](https://gitlab.presidio.com/ai_works/azure_rbac_multiagents/-/blob/main/specialist2/main.py), [`specialist2/role_token.py`](https://gitlab.presidio.com/ai_works/azure_rbac_multiagents/-/blob/main/specialist2/role_token.py)
